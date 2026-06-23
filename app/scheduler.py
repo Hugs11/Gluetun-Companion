@@ -59,6 +59,34 @@ _last_docker_event_ts: float = 0.0   # epoch of last event-triggered quick check
 _DOCKER_EVENT_COOLDOWN = 300          # minimum seconds between two event-triggered checks
 
 
+def _mapping_get(row, key: str, default=None):
+    """Return a mapping value from dict-like objects and sqlite3.Row."""
+    getter = getattr(row, 'get', None)
+    if callable(getter):
+        return getter(key, default)
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _docker_start_event_matches_container(event: dict, container_name: str) -> bool:
+    """Docker's container event filter can still surface related containers.
+
+    Keep the restart watcher focused on the real Gluetun container and ignore
+    benchmark/test containers such as gluetun-companion-test.
+    """
+    attrs = ((event or {}).get('Actor') or {}).get('Attributes') or {}
+    names = [
+        str(attrs.get('name') or '').lstrip('/'),
+        str(attrs.get('container') or '').lstrip('/'),
+    ]
+    names = [name for name in names if name]
+    if names:
+        return container_name in names
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Weighted score for best-server selection
 # ---------------------------------------------------------------------------
@@ -1709,7 +1737,10 @@ def _do_benchmark(app, skip_quick_check: bool = False, observation: bool = False
 
                 # Build lookup helpers: profile id and rotation_allowed flag per server name
                 _srv_profile_map = {
-                    row['name']: (row['vpn_profile_id'], bool(row.get('vp_rotation_allowed', False)))
+                    row['name']: (
+                        row['vpn_profile_id'],
+                        bool(_mapping_get(row, 'vp_rotation_allowed', False)),
+                    )
                     for row in servers
                 }
 
@@ -2723,6 +2754,12 @@ def _docker_event_loop(app, container_name: str) -> None:
                 decode=True,
             ):
                 if event.get('Action') != 'start':
+                    continue
+                if not _docker_start_event_matches_container(event, container_name):
+                    logger.debug(
+                        'Docker event: ignoring start for non-target container %s',
+                        ((event.get('Actor') or {}).get('Attributes') or {}).get('name') or '?',
+                    )
                     continue
 
                 # Record every Gluetun container ID (Companion-triggered or
